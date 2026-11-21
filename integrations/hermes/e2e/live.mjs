@@ -37,7 +37,7 @@ async function connect() {
   stopped = once(companion, 'close')
   return until('the Hermes launcher', async () => {
     if (companion.exitCode !== null) throw new Error('Hermes companion exited before registering')
-    return (await node.call('launchers.list')).launchers.find((l) => l.name === 'hermes')
+    return ((await node.call('launchers.list')).launchers ?? []).find((l) => l.name === 'hermes')
   }, 25_000)
 }
 
@@ -67,12 +67,15 @@ approvals:
   const { session } = await node.call('session.start', { launcher: 'hermes', cwd, session_id: proposedID })
   sid = session.session_id
   const row = await until('the Hermes session', async () =>
-    (await node.call('sessions.list')).sessions.find((s) => s.session_id === sid))
+    ((await node.call('sessions.list')).sessions ?? []).find((s) => s.session_id === sid))
   check('the row has the Hermes runtime identity and advertised capabilities',
     sid === proposedID && row.agent === 'hermes' && row.agent_label === 'Hermes Agent' && row.space_kind === 'hermes' &&
     row.source_kind === 'runtime' && row.capabilities?.send === true && row.capabilities?.interrupt === true && !row.pane_id)
   const request = (method, params) => node.call(method, { session_id: sid, ...params })
-  const page = (params) => request('session.items', params)
+  const page = async (params) => {
+    const result = await request('session.items', params)
+    return { ...result, items: result.items ?? [] }
+  }
   const send = (text, client_msg_id = randomUUID()) => request('session.send', { text, client_msg_id })
   const waitText = (text) => until(text, async () => (await page()).items.some((i) => i.text?.trim() === text), 35_000)
   await request('session.watch', { since_seq: 0 })
@@ -111,20 +114,17 @@ approvals:
     session_id: other.session_id,
   })).items ?? []).some((i) => i.text === 'Hermes test reply'), 30_000)
   check('a second workspace completes while the first is still working', node.status(sid) === 'working' && other.cwd === secondCwd)
-  const interrupt = request('session.interrupt')
-  // Give Hermes time to process the cancel notification before the blocked HTTP response is released.
-  await new Promise((resolve) => setTimeout(resolve, 350))
+  await request('session.interrupt')
   provider.release()
-  await interrupt
   await waitText('已中断')
   check('interrupt settles against the real prompt outcome', (await page()).items.some((i) => i.text === '已中断'))
   check('all live item batches continue the prior cursor', node.gaps(sid).length === 0, `${node.batches(sid).length} batches`)
   await disconnect()
   await until('the launcher is absent when disconnected', async () =>
-    !(await node.call('launchers.list')).launchers.some((l) => l.name === 'hermes'), 10_000)
+    !((await node.call('launchers.list')).launchers ?? []).some((l) => l.name === 'hermes'), 10_000)
   await connect()
   await until('the original session is rediscovered', async () =>
-    (await node.call('sessions.list')).sessions.some((s) => s.session_id === sid), 10_000)
+    ((await node.call('sessions.list')).sessions ?? []).some((s) => s.session_id === sid), 10_000)
   const reloaded = await page()
   check('a fresh companion loads persisted history from Hermes', reloaded.history !== first.history &&
     reloaded.items.some((i) => i.text === 'Hermes test reply'))
