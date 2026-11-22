@@ -156,12 +156,76 @@ test('missing Hermes executable rejects startup and cleans up without a close ev
   const worker = new HermesAcp({ bin })
   // Some spawn failures may never deliver close to the transport.
   worker.child.removeAllListeners('close')
-  await assert.rejects(worker.initialize(), /Hermes ACP disconnected/)
-  await worker.exited
+  const failed = assert.rejects(worker.initialize(), /Hermes ACP disconnected/)
   await worker.stop()
+  assert.equal(worker.closed, true)
+  assert.equal(worker.pending.size, 0)
+  await Promise.all([failed, worker.exited, worker.drained])
   const runtime = createHermesRuntime({ bin, env: { ...process.env, HERMES_HOME: root } })
   await assert.rejects(runtime.start(), /Hermes ACP disconnected/)
   await runtime.stop()
+})
+
+test('ended or destroyed stdin rejects new calls without leaving a pending request', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'hermes-input-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  for (const closeInput of ['end', 'destroy']) {
+    const worker = new HermesAcp({ bin: fixture, cwd: root, env: { ...process.env, HERMES_TEST_STATE: root } })
+    t.after(() => worker.stop())
+    await worker.initialize()
+    worker.child.stdin[closeInput]()
+    await assert.rejects(worker.call('session/list', {}, 0), /Hermes ACP disconnected/)
+    assert.equal(worker.pending.size, 0)
+    await worker.stop()
+  }
+})
+
+test('an asynchronous pipe write failure rejects a call before worker exit', {
+  skip: process.platform === 'win32', timeout: 5_000,
+}, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'hermes-pipe-'))
+  const worker = new HermesAcp({
+    bin: fixture, cwd: root,
+    env: { ...process.env, HERMES_TEST_STATE: root, HERMES_TEST_CLOSE_STDIN_AFTER_LIST: '1' },
+  })
+  t.after(async () => {
+    await worker.stop()
+    await rm(root, { recursive: true, force: true })
+  })
+  await worker.initialize()
+  assert.deepEqual(await worker.call('session/list', {}), { sessions: [] })
+  assert.equal(worker.child.stdin.writable, true)
+  await assert.rejects(worker.call('session/list', {}, 0), /Hermes ACP disconnected/)
+  assert.equal(worker.pending.size, 0)
+  assert.equal(worker.child.exitCode, null)
+  assert.equal(worker.child.signalCode, null)
+  assert.equal(worker.writable, false)
+})
+
+test('a failed prompt write ends the turn and retains its failure across reload', {
+  skip: process.platform === 'win32',
+}, async (t) => {
+  const { cwd, call } = await setup(t)
+  const { session } = await call('session.start', { cwd, prompt: 'close input' })
+  const session_id = session.session_id
+  const read = async () => (await call('session.items', { session_id })).items
+  await until('last successful reply', async () => (await read()).at(-1)?.text === 'input closed')
+  await call('session.send', { session_id, text: 'failed write', client_msg_id: 'failed-write' })
+  await until('failed write notice', async () => (await read()).at(-1)?.kind === 'notice')
+  await until('replacement worker accepts a prompt', async () => {
+    try {
+      return await call('session.send', { session_id, text: 'recovered' })
+    } catch (error) {
+      if (error.code !== 'not_delivered') throw error
+      return false
+    }
+  })
+  await until('replacement worker reply', async () => (await read()).at(-1)?.text === 'echo: recovered')
+  const items = await read()
+  assert.deepEqual(items.map((item) => item.text), [
+    'close input', 'input closed', 'failed write', '出错了', 'recovered', 'echo: recovered',
+  ])
+  assert.equal(items[2].client_msg_id, 'failed-write')
 })
 
 test('normal permission requests and prompt replies reach their respective handlers', async (t) => {
@@ -202,7 +266,10 @@ test('worker exit drains its final response and stop settles without a close eve
   worker.child.stdout.resume()
   assert.deepEqual(await reply, { sessions: [] })
   await stop
+  await worker.drained
   assert.equal(worker.closed, true)
+  assert.equal(worker.child.stdout.destroyed, true)
+  assert.equal(worker.child.stderr.destroyed, true)
 })
 
 test('consecutive Hermes message IDs live-stream the full text and clear it at the turn boundary', async (t) => {

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto'
+import { closeSync } from 'node:fs'
 import { readdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -16,6 +17,13 @@ let active
 let permissionId = 0
 
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity })
+function closeInput() {
+  lines.close()
+  closeSync(0)
+  // Stay alive so the host observes a write failure before a process exit.
+  setTimeout(() => process.exit(0), 8_000)
+}
+
 for await (const line of lines) {
   const { id, method, params, result } = JSON.parse(line)
   switch (method) {
@@ -28,6 +36,7 @@ for await (const line of lines) {
       const next = params.cursor ? files.indexOf(params.cursor) + 1 : 0
       const selected = files[next]
       const sessions = selected ? [JSON.parse(await readFile(join(root, selected), 'utf-8')).info] : []
+      if (process.env.HERMES_TEST_CLOSE_STDIN_AFTER_LIST) closeInput()
       reply(id, { sessions, ...(next + 1 < files.length ? { nextCursor: selected } : {}) })
       if (process.env.HERMES_TEST_EXIT_AFTER_LIST) process.stdout.write('', () => process.exit(0))
       break
@@ -52,7 +61,10 @@ for await (const line of lines) {
         await save([agent('saved before exit')])
         process.exit(1)
       }
-      if (text === 'hold') {
+      if (text === 'close input') {
+        await finish([agent('input closed')])
+        closeInput()
+      } else if (text === 'hold') {
         update(params.sessionId, agent('streaming'))
       } else if (text === 'segmented') {
         update(params.sessionId, agent('first ', 'one'))

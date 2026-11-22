@@ -13,6 +13,7 @@ export class HermesAcp {
     this.pending = new Map()
     this.nextId = 0
     this.closed = false
+    this.writeFailed = false
     // Provider logs can contain prompts and credentials.
     child.stderr.resume()
     const lines = createInterface({ input: child.stdout, crlfDelay: Infinity })
@@ -87,9 +88,20 @@ export class HermesAcp {
     this.write({ id: msg.id, result: { outcome: outcome ?? { outcome: 'cancelled' } } })
   }
 
-  write(message) {
-    if (this.closed || !this.child.stdin.writable) return false
-    this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n')
+  get writable() {
+    const input = this.child.stdin
+    return !this.closed && !this.writeFailed && this.child.exitCode === null && this.child.signalCode === null &&
+      !input.destroyed && !input.writableEnded && input.writable
+  }
+
+  write(message, onFailure) {
+    if (!this.writable) return false
+    const line = JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n'
+    this.child.stdin.write(line, (error) => {
+      if (!error) return
+      this.writeFailed = true
+      onFailure?.(new Error('Hermes ACP disconnected'))
+    })
     return true
   }
 
@@ -101,8 +113,8 @@ export class HermesAcp {
     const id = ++this.nextId
     return new Promise((resolve, reject) => {
       const finish = (fn, value) => {
+        if (!this.pending.delete(id)) return
         clearTimeout(timer)
-        this.pending.delete(id)
         fn(value)
       }
       const fail = (error) => finish(reject, error)
@@ -113,7 +125,11 @@ export class HermesAcp {
           ? fail(new Error(`Hermes ACP ${method} failed (${Number(msg.error.code) || 'unknown'})`))
           : finish(resolve, msg.result),
       })
-      if (!this.write({ id, method, params })) fail(new Error('Hermes ACP disconnected'))
+      try {
+        if (!this.write({ id, method, params }, fail)) fail(new Error('Hermes ACP disconnected'))
+      } catch (error) {
+        fail(error)
+      }
     })
   }
 
@@ -133,7 +149,9 @@ export class HermesAcp {
   }
 
   async terminate() {
-    if (!this.child.pid) return
+    // Node emits a spawn error when there is no PID. Wait for that handler to
+    // reject pending calls and settle the drain before reporting a stopped worker.
+    if (!this.child.pid) return this.drained
     this.child.stdin.end()
     const timer = new AbortController()
     const exited = (ms) => Promise.race([

@@ -377,7 +377,7 @@ export function createHermesRuntime({
     rt.sessionsChanged()
     try {
       turn.acp = await loaded(s)
-      if (turn.abort.signal.aborted || turn.acp.closed || stopped) {
+      if (turn.abort.signal.aborted || !turn.acp.writable || stopped) {
         throw new RpcError('Hermes did not receive the message', 'not_delivered', { delivered: 'none' })
       }
       if (key) s.seen.add(key)
@@ -415,7 +415,7 @@ export function createHermesRuntime({
     } else if (stopReason !== 'end_turn') {
       s.turnError = '出错了'
       addItem(s.content, { role: 'system', kind: 'notice', text: s.turnError })
-      if (turn.acp.closed) {
+      if (!turn.acp.writable) {
         // Retain the dispatched turn locally until a fresh native replay can tell
         // whether Hermes had saved its input before the disconnect.
         const localOnly = s.failures.filter((failure) => !failure.persisted).length
