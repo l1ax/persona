@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { once } from 'node:events'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -7,6 +8,8 @@ import { test } from 'node:test'
 import { startFakeNode, until } from '../../runtime-sdk/testing/fake-node.js'
 import { HermesAcp } from '../lib/acp.js'
 import { createHermesRuntime } from '../lib/runtime.js'
+
+const fixture = fileURLToPath(new URL('./acp-fixture.mjs', import.meta.url))
 
 async function setup(t) {
   const root = await mkdtemp(join(tmpdir(), 'hermes-test-'))
@@ -23,15 +26,35 @@ async function setup(t) {
     await runtime?.stop()
     const previous = node.hellos
     runtime = createHermesRuntime({
-      bin: fileURLToPath(new URL('./acp-fixture.mjs', import.meta.url)), socketPath: node.path,
+      bin: fixture, socketPath: node.path,
       env: { ...process.env, HERMES_HOME: storage, HERMES_TEST_STATE: storage }, retryMs: 20, scanMs: 25, idleMs: 140,
     })
     await runtime.start()
     await until('runtime hello', () => node.hellos > previous && node.peer)
   }
   await restart()
-  return { node, cwd, restart, call: (method, params) => node.peer.call(method, params) }
+  return { node, cwd, storage, restart, call: (method, params) => node.peer.call(method, params) }
 }
+
+test('discovery only marks a saved identity claimed by that session as started by Persona', async (t) => {
+  const { cwd, storage, restart, call } = await setup(t)
+  const identities = join(storage, 'persona-acp')
+  await mkdir(identities)
+  for (const sessionId of ['native-a', 'native-b']) {
+    await writeFile(join(storage, sessionId + '.json'), JSON.stringify({
+      info: { sessionId, cwd, updatedAt: new Date().toISOString() },
+      updates: [{ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: sessionId } }],
+    }))
+    await writeFile(join(identities, sessionId + '.json'), JSON.stringify({ version: 1, id: 'persona-start' }))
+  }
+  await restart()
+  const { rows } = await call('sessions.history', { since: new Date(0).toISOString() })
+  const flags = Object.fromEntries(rows.map((row) => [row.session_id, row.started_by_persona]))
+  assert.deepEqual(flags, { 'persona-start': true, 'hermes-native-b': false })
+  const items = async (session_id) => (await call('session.items', { session_id })).items
+  assert.equal((await items('persona-start'))[0].text, 'native-a')
+  assert.equal((await items('hermes-native-b'))[0].text, 'native-b')
+})
 
 test('launch, stream, page, deduplicate and recover across node reconnect and companion restart', async (t) => {
   const { node, cwd, restart, call } = await setup(t)
@@ -139,6 +162,47 @@ test('missing Hermes executable rejects startup and cleans up without a close ev
   const runtime = createHermesRuntime({ bin, env: { ...process.env, HERMES_HOME: root } })
   await assert.rejects(runtime.start(), /Hermes ACP disconnected/)
   await runtime.stop()
+})
+
+test('normal permission requests and prompt replies reach their respective handlers', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'hermes-permission-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const permissions = []
+  const worker = new HermesAcp({
+    bin: fixture, cwd: root, env: { ...process.env, HERMES_TEST_STATE: root },
+    onPermission: (params) => {
+      permissions.push(params)
+      return { outcome: 'selected', optionId: 'once' }
+    },
+  })
+  t.after(() => worker.stop())
+  await worker.initialize()
+  const { sessionId } = await worker.call('session/new', { cwd: root, mcpServers: [] })
+  const reply = await worker.call('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'permission' }] })
+  assert.equal(reply.stopReason, 'end_turn')
+  assert.equal(permissions.length, 1)
+  assert.equal(permissions[0].sessionId, sessionId)
+})
+
+test('worker exit drains its final response and stop settles without a close event', { timeout: 4_000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'hermes-exit-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const worker = new HermesAcp({
+    bin: fixture, cwd: root,
+    env: { ...process.env, HERMES_TEST_STATE: root, HERMES_TEST_EXIT_AFTER_LIST: '1' },
+  })
+  await worker.initialize()
+  worker.child.removeAllListeners('close')
+  worker.child.stdout.pause()
+  const exit = once(worker.child, 'exit')
+  const reply = worker.call('session/list', {})
+  const stop = worker.stop()
+  // Defer reads until after exit to exercise data still buffered in stdout.
+  assert.deepEqual(await exit, [0, null])
+  worker.child.stdout.resume()
+  assert.deepEqual(await reply, { sessions: [] })
+  await stop
+  assert.equal(worker.closed, true)
 })
 
 test('consecutive Hermes message IDs live-stream the full text and clear it at the turn boundary', async (t) => {

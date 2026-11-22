@@ -3,6 +3,7 @@ import { createInterface } from 'node:readline'
 import { setTimeout as delay } from 'node:timers/promises'
 
 const RPC_TIMEOUT = 20_000
+const STDIO_DRAIN_TIMEOUT = 1_000
 
 export class HermesAcp {
   constructor({ bin, cwd, env, onUpdate, onPermission, onExit }) {
@@ -14,28 +15,45 @@ export class HermesAcp {
     this.closed = false
     // Provider logs can contain prompts and credentials.
     child.stderr.resume()
-    child.once('exit', () => {
-      disconnect()
-      if (this.processGroup) this.signal('SIGKILL')
-    })
     const lines = createInterface({ input: child.stdout, crlfDelay: Infinity })
+    const exited = Promise.withResolvers()
+    const drained = Promise.withResolvers()
+    this.exited = exited.promise
+    this.drained = drained.promise
+    let drainTimer
     const disconnect = () => {
       if (this.closed) return
       this.closed = true
+      clearTimeout(drainTimer)
       lines.close()
       for (const { fail } of this.pending.values()) fail(new Error('Hermes ACP disconnected'))
+      drained.resolve()
       onExit?.()
     }
-    this.exited = new Promise((resolve) => {
-      child.once('close', () => { disconnect(); resolve() })
-      child.once('error', () => {
+    child.once('exit', () => {
+      exited.resolve()
+      // The process may exit before its last response is read. Bound the drain
+      // in case inherited pipes keep stdio open after the process has gone.
+      drainTimer = setTimeout(() => {
         disconnect()
-        if (!child.pid) resolve()
-      })
+        child.stdout.destroy()
+        child.stderr.destroy()
+        child.stdin.destroy()
+      }, STDIO_DRAIN_TIMEOUT)
+      if (this.processGroup) this.signal('SIGKILL')
+    })
+    child.once('close', () => {
+      exited.resolve()
+      disconnect()
+    })
+    child.once('error', () => {
+      if (!child.pid) {
+        exited.resolve()
+        disconnect()
+      }
     })
     child.stdin.once('error', () => {
-      disconnect()
-      void this.stop()
+      void this.stop().catch(disconnect)
     })
     lines.on('line', (line) => {
       let msg
@@ -123,13 +141,16 @@ export class HermesAcp {
       delay(ms, false, { signal: timer.signal, ref: false }),
     ])
     try {
-      if (await exited(1_000)) return
-      this.signal('SIGTERM')
-      if (await exited(2_000)) return
-      this.signal('SIGKILL')
-      await this.exited
+      if (!(await exited(1_000))) {
+        this.signal('SIGTERM')
+        if (!(await exited(2_000))) {
+          this.signal('SIGKILL')
+          await this.exited
+        }
+      }
     } finally {
       timer.abort()
     }
+    await this.drained
   }
 }

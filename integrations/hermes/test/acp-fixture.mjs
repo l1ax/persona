@@ -29,6 +29,7 @@ for await (const line of lines) {
       const selected = files[next]
       const sessions = selected ? [JSON.parse(await readFile(join(root, selected), 'utf-8')).info] : []
       reply(id, { sessions, ...(next + 1 < files.length ? { nextCursor: selected } : {}) })
+      if (process.env.HERMES_TEST_EXIT_AFTER_LIST) process.stdout.write('', () => process.exit(0))
       break
     }
     case 'session/new':

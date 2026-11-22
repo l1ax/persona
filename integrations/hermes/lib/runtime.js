@@ -130,8 +130,8 @@ export function createHermesRuntime({
           if (!s) {
             s = state(info.sessionId, info.cwd, info)
             const id = saved.get(s.raw)
-            s.id = id && !sessions.has(id) ? id : `${RUNTIME}-${s.raw}`
-            s.startedHere = Boolean(id)
+            s.startedHere = Boolean(id && !sessions.has(id))
+            s.id = s.startedHere ? id : `${RUNTIME}-${s.raw}`
             if (sessions.has(s.id)) continue
             nativeSessions.set(s.raw, s)
             sessions.set(s.id, s)
