@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { createRuntime, interactionId, light, page, RpcError } from '../../runtime-sdk/index.js'
 import { HermesAcp } from './acp.js'
 import { identities, nativeID, personaID, profileHome } from './identity.js'
-import { addItem, applyUpdate, flush, toolInput, toolName, transcript } from './items.js'
+import { addItem, applyUpdate, flush, isUserText, restoreFailures, toolInput, toolName, transcript } from './items.js'
 
 const RUNTIME = 'hermes'
 const LABEL = 'Hermes Agent'
@@ -80,7 +80,7 @@ export function createHermesRuntime({
     return {
       raw, cwd, title: info.title || basename(cwd) || LABEL,
       updated: timestamp(info.updatedAt) ?? now(), status: 'idle', history: randomUUID(), rev: 0,
-      seen: new Set(), startedHere: false, persisted: false, model: '',
+      seen: new Set(), failures: [], startedHere: false, persisted: false, model: '',
     }
   }
 
@@ -197,7 +197,7 @@ export function createHermesRuntime({
         flush(s.replay)
         s.model = result.models?.currentModelId ?? s.model
         const previous = s.content
-        const next = s.replay
+        const next = restoreFailures(s.replay, s.failures)
         const comparable = (list) => list.map(({ id, seq, ts, client_msg_id, ...value }) => value)
         if (!previous || JSON.stringify(comparable(previous.items)) !== JSON.stringify(comparable(next.items))) {
           if (previous) s.history = randomUUID()
@@ -259,13 +259,22 @@ export function createHermesRuntime({
       applyUpdate(s.replay, update, true)
       return
     }
-    if (!s.turn || !s.content) return
+    // Live content belongs to a prompt sent by this companion. An attached Hermes
+    // gateway viewer can receive other clients' chunks without their prompt outcome.
+    const turn = s.turn
+    if (!turn?.dispatched || !s.content) return
     const before = s.content.items.length
     const previous = s.content.segment
     applyUpdate(s.content, update, false)
     const segment = s.content.segment
-    if (previous !== segment && previous?.kind === 'text') rt.streamEnd(s.id)
-    if (segment?.kind === 'text' && update.sessionUpdate === 'agent_message_chunk') rt.stream(s.id, segment.text)
+    if (previous?.kind === 'text' && segment?.kind !== 'text') {
+      turn.livePrefix = ''
+      rt.streamEnd(s.id)
+    }
+    if (segment?.kind === 'text' && update.sessionUpdate === 'agent_message_chunk') {
+      if (previous?.kind === 'text' && previous !== segment) turn.livePrefix += previous.text
+      rt.stream(s.id, turn.livePrefix + segment.text)
+    }
     if (s.content.items.length !== before) publish(s, before)
   }
 
@@ -361,7 +370,7 @@ export function createHermesRuntime({
     if (s.turn) throw new RpcError('Hermes is already processing a message', 'turn_running', { delivered: 'none' })
     keepWorker(s)
     let settle
-    const turn = { key: key || randomUUID(), abort: new AbortController(),
+    const turn = { key: key || randomUUID(), abort: new AbortController(), livePrefix: '',
       done: new Promise((resolve) => { settle = resolve }) }
     s.turn = turn
     s.turnError = undefined
@@ -374,6 +383,7 @@ export function createHermesRuntime({
       if (key) s.seen.add(key)
       if (s.seen.size > 500) s.seen.delete(s.seen.values().next().value)
       const from = s.content.items.length
+      turn.from = from
       addItem(s.content, { role: 'user', kind: 'text', text, ...(key ? { client_msg_id: key } : {}) })
       s.updated = now()
       publish(s, from)
@@ -405,6 +415,13 @@ export function createHermesRuntime({
     } else if (stopReason !== 'end_turn') {
       s.turnError = '出错了'
       addItem(s.content, { role: 'system', kind: 'notice', text: s.turnError })
+      if (turn.acp.closed) {
+        // Retain the dispatched turn locally until a fresh native replay can tell
+        // whether Hermes had saved its input before the disconnect.
+        const localOnly = s.failures.filter((failure) => !failure.persisted).length
+        const userIndex = s.content.items.slice(0, turn.from).filter(isUserText).length - localOnly
+        s.failures.push({ userIndex, items: s.content.items.slice(turn.from) })
+      }
     }
     s.turn = undefined
     s.status = stopReason ? 'done' : 'offline'

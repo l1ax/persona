@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
 import { startFakeNode, until } from '../../runtime-sdk/testing/fake-node.js'
+import { HermesAcp } from '../lib/acp.js'
 import { createHermesRuntime } from '../lib/runtime.js'
 
 async function setup(t) {
@@ -107,9 +108,51 @@ test('a crashed worker only ends its own turn and saved sessions can continue', 
   const session_id = session.session_id
   const read = () => call('session.items', { session_id })
   await until('saved reply', async () => (await read()).items.at(-1)?.text === 'echo: save first')
-  await call('session.send', { session_id, text: 'disconnect' })
+  await call('session.send', { session_id, text: 'disconnect', client_msg_id: 'lost-turn' })
   await until('crash notice', async () => (await read()).items.at(-1)?.kind === 'notice')
   await call('session.send', { session_id, text: 'recovered' })
   await until('reply after recovery', async () => (await read()).items.at(-1)?.text === 'echo: recovered')
-  assert.deepEqual((await read()).items.map((i) => i.text), ['save first', 'echo: save first', 'recovered', 'echo: recovered'])
+  const failed = ['save first', 'echo: save first', 'disconnect', '出错了', 'recovered', 'echo: recovered']
+  assert.deepEqual((await read()).items.map((i) => i.text), failed)
+  assert.equal((await read()).items[2].client_msg_id, 'lost-turn')
+  await call('session.send', { session_id, text: 'saved disconnect', client_msg_id: 'saved-turn' })
+  await until('second crash notice', async () => (await read()).items.at(-1)?.kind === 'notice')
+  await call('session.send', { session_id, text: 'continue again' })
+  await until('reply after second reload', async () => (await read()).items.at(-1)?.text === 'echo: continue again')
+  const restored = await read()
+  assert.deepEqual(restored.items.map((i) => i.text), [
+    ...failed, 'saved disconnect', 'saved before exit', '出错了', 'continue again', 'echo: continue again',
+  ])
+  assert.equal(restored.items[6].client_msg_id, 'saved-turn')
+})
+
+test('missing Hermes executable rejects startup and cleans up without a close event', { timeout: 3_000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'hermes-missing-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const bin = join(root, 'missing-hermes')
+  const worker = new HermesAcp({ bin })
+  // Some spawn failures may never deliver close to the transport.
+  worker.child.removeAllListeners('close')
+  await assert.rejects(worker.initialize(), /Hermes ACP disconnected/)
+  await worker.exited
+  await worker.stop()
+  const runtime = createHermesRuntime({ bin, env: { ...process.env, HERMES_HOME: root } })
+  await assert.rejects(runtime.start(), /Hermes ACP disconnected/)
+  await runtime.stop()
+})
+
+test('consecutive Hermes message IDs live-stream the full text and clear it at the turn boundary', async (t) => {
+  const { node, cwd, call } = await setup(t)
+  const { session } = await call('session.start', { cwd })
+  const params = { session_id: session.session_id }
+  await call('session.watch', { ...params, since_seq: 0 })
+  await call('session.send', { ...params, text: 'segmented' })
+  const deltas = () => node.all('session.delta').map(({ text }) => text)
+  await until('full replacement delta', () => deltas().includes('first second'))
+  assert.equal(deltas().includes('second'), false)
+  await call('session.interrupt', params)
+  await until('cleared stream', () => deltas().at(-1) === '')
+  await call('session.send', { ...params, text: 'hold' })
+  await until('next turn starts a fresh stream', () => deltas().at(-1) === 'streaming')
+  await call('session.interrupt', params)
 })

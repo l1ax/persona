@@ -25,6 +25,37 @@ export function flush(state) {
   addItem(state, { role, kind, text })
 }
 
+export function restoreFailures(state, failures) {
+  if (!failures.length) return state
+  const users = state.items.flatMap((item, index) => isUserText(item) ? [index] : [])
+  const restored = transcript()
+  const copy = ({ id, seq, ...item }) => addItem(restored, item)
+  let copied = 0
+  for (const failure of failures) {
+    const begin = users[failure.userIndex] ?? state.items.length
+    // Classify the failed input on its first reload, before a retry of the same text
+    // can occupy the same native position.
+    failure.persisted ??= state.items[begin]?.text === failure.items[0].text
+    const end = failure.persisted ? (users[failure.userIndex + 1] ?? state.items.length) : begin
+    state.items.slice(copied, begin).forEach(copy)
+    if (failure.persisted && begin < end) {
+      const user = copy(state.items[begin])
+      if (failure.items[0].client_msg_id) user.client_msg_id = failure.items[0].client_msg_id
+      state.items.slice(begin + 1, end).forEach(copy)
+      copy(failure.items.at(-1))
+    } else {
+      failure.items.forEach(copy)
+    }
+    copied = end
+  }
+  state.items.slice(copied).forEach(copy)
+  return restored
+}
+
+export function isUserText(item) {
+  return item.role === 'user' && item.kind === 'text'
+}
+
 function chunk(state, update, role, kind) {
   if (update.content?.type !== 'text' || !update.content.text) return
   const message = update.messageId

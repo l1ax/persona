@@ -9,7 +9,7 @@ const write = (message) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0',
 const reply = (id, result) => write({ id, result })
 const update = (sessionId, update) => write({ method: 'session/update', params: { sessionId, update } })
 const user = (text) => ({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text } })
-const agent = (text) => ({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } })
+const agent = (text, messageId) => ({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, messageId })
 const tool = { toolCallId: 'tool-1', title: 'Echo', kind: 'execute', rawInput: { command: 'echo sample' } }
 let session
 let active
@@ -47,8 +47,15 @@ for await (const line of lines) {
       const text = params.prompt[0].text
       active = { id, text }
       if (text === 'disconnect') process.exit(1)
+      if (text === 'saved disconnect') {
+        await save([agent('saved before exit')])
+        process.exit(1)
+      }
       if (text === 'hold') {
         update(params.sessionId, agent('streaming'))
+      } else if (text === 'segmented') {
+        update(params.sessionId, agent('first ', 'one'))
+        update(params.sessionId, agent('second', 'two'))
       } else if (text === 'permission') {
         active.permission = 'permission-' + ++permissionId
         write({ id: active.permission, method: 'session/request_permission', params: {
@@ -79,11 +86,15 @@ for await (const line of lines) {
 }
 
 async function finish(events, reason = 'end_turn') {
-  const { id, text } = active
+  const { id } = active
+  await save(events)
   active = undefined
-  session.info.updatedAt = new Date().toISOString()
-  session.updates.push(user(text), ...events)
-  await writeFile(join(root, session.info.sessionId + '.json'), JSON.stringify(session))
   for (const event of events) update(session.info.sessionId, event)
   reply(id, { stopReason: reason })
+}
+
+async function save(events) {
+  session.info.updatedAt = new Date().toISOString()
+  session.updates.push(user(active.text), ...events)
+  await writeFile(join(root, session.info.sessionId + '.json'), JSON.stringify(session))
 }

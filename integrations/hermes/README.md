@@ -27,9 +27,15 @@ and use a separate Hermes profile if another ACP client needs to work concurrent
   Hermes' ACP catalog and loads the transcript when needed. Empty sessions are live only until their first
   persisted turn. A small mapping in the Hermes profile keeps Persona's session ID stable across restarts.
   The UI may refresh its cursor when the saved transcript differs from the live transcript.
+- A discovered session opens from the history returned by `session/load`. Live output, tool approvals,
+  working status and cancellation in Persona track prompts sent by this companion. On gateway-backed Hermes,
+  an attached ACP client can also receive chunks from another client's prompt, but that prompt's terminal
+  response goes to its sender. Use the originating client for a live view of turns started there.
 - Retry a send with the same client message ID across a node reconnect. The running companion deduplicates sends.
   On a companion restart, Hermes restores transcript content. The client message IDs and pending turn state are
   local to the previous companion process.
+  If a worker disconnects during a prompt, the running companion keeps the locally dispatched input and failure
+  notice when reloading the session. Hermes owns the durable history across companion restarts.
 - Answer Hermes tool permission requests in Persona. The companion maps approval to **Allow once**. Dismissal
   or loss of the card cancels the permission request. Hermes applies the profile's permission settings.
 - Interrupt an active turn. Persona waits for the ACP prompt to settle before confirming. Each working
@@ -46,5 +52,5 @@ PERSONAD=<path-to-personad> HERMES_BIN=<path-to-hermes> node integrations/hermes
 ```
 
 The live test creates a temporary node home and Hermes profile and serves a local model fixture. It exercises the
-actual Persona launcher and the Hermes ACP process without using a model account. The test uses Hermes Agent
-0.21.5 (`v2026.9.24`).
+actual Persona launcher and the Hermes ACP process without using a model account. It has been tested with
+Hermes Agent 0.21.5 (`v2026.9.24`) and 0.23.3.

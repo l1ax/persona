@@ -28,8 +28,11 @@ export class HermesAcp {
     }
     this.exited = new Promise((resolve) => {
       child.once('close', () => { disconnect(); resolve() })
+      child.once('error', () => {
+        disconnect()
+        if (!child.pid) resolve()
+      })
     })
-    child.once('error', disconnect)
     child.stdin.once('error', () => {
       disconnect()
       void this.stop()
@@ -112,6 +115,7 @@ export class HermesAcp {
   }
 
   async terminate() {
+    if (!this.child.pid) return
     this.child.stdin.end()
     const timer = new AbortController()
     const exited = (ms) => Promise.race([
