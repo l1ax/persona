@@ -1,15 +1,24 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
 import { startFakeNode, until } from '../../runtime-sdk/testing/fake-node.js'
 import { HermesAcp } from '../lib/acp.js'
+import { addItem, reconcileReplay, transcript } from '../lib/items.js'
 import { createHermesRuntime } from '../lib/runtime.js'
 
 const fixture = fileURLToPath(new URL('./acp-fixture.mjs', import.meta.url))
+const sessionText = (sessionUpdate, text) => ({ sessionUpdate, content: { type: 'text', text } })
+
+async function seedSession(storage, cwd, extra = {}, updates = []) {
+  await writeFile(join(storage, 'native-seeded.json'), JSON.stringify({
+    info: { sessionId: 'native-seeded', cwd, updatedAt: new Date().toISOString() }, updates, ...extra,
+  }))
+  return { session_id: 'hermes-native-seeded' }
+}
 
 async function setup(t) {
   const root = await mkdtemp(join(tmpdir(), 'hermes-test-'))
@@ -98,6 +107,84 @@ test('launch, stream, page, deduplicate and recover across node reconnect and co
   await until('continued reply', async () => (await read()).items.some((i) => i.text === 'echo: continued'))
 })
 
+test('interrupt settles a local wait while a shared native load is still pending', { timeout: 5_000 }, async (t) => {
+  const { cwd, storage, call } = await setup(t)
+  const hold = join(storage, 'load-hold')
+  await writeFile(hold, '')
+  const session = await seedSession(storage, cwd, { holdLoad: true })
+  const cancelled = assert.rejects(call('session.send', { ...session, text: 'cancelled before load' }), {
+    code: 'not_delivered',
+  })
+  await until('native load started', () => access(join(storage, 'load-started')).then(() => true, () => false))
+  assert.deepEqual(await call('session.interrupt', session), { ok: true })
+  await cancelled
+  const next = call('session.send', { ...session, text: 'replacement' })
+  await rm(hold)
+  await next
+  const read = async () => (await call('session.items', session)).items
+  await until('replacement reply', async () => (await read()).at(-1)?.text === 'echo: replacement')
+  assert.deepEqual((await read()).map((item) => item.text), ['replacement', 'echo: replacement'])
+})
+
+test('failed native load can retry even if stopping the failed worker rejects', async (t) => {
+  const { cwd, storage, call } = await setup(t)
+  const session = await seedSession(storage, cwd, { failLoad: true })
+  const stop = HermesAcp.prototype.stop
+  let failCleanup = true
+  t.mock.method(HermesAcp.prototype, 'stop', function () {
+    if (failCleanup) {
+      failCleanup = false
+      return Promise.reject(new Error('Could not stop the first worker'))
+    }
+    return stop.call(this)
+  })
+  await assert.rejects(call('session.items', session), /Hermes ACP session\/load failed/)
+  assert.deepEqual((await call('session.items', session)).items, [])
+  await call('session.send', { ...session, text: 'recovered' })
+  await until('retry reply', async () => (await call('session.items', session)).items.at(-1)?.text === 'echo: recovered')
+})
+
+test('history comparison publishes client ID changes and preserves matching IDs through replay', () => {
+  const item = { role: 'user', kind: 'text', text: 'input' }
+  const old = transcript()
+  addItem(old, item)
+  const restored = transcript()
+  addItem(restored, { ...item, client_msg_id: 'first-id' })
+  assert.equal(reconcileReplay(old, restored), restored)
+  const replay = transcript()
+  addItem(replay, item)
+  assert.equal(reconcileReplay(restored, replay), restored)
+  assert.equal(replay.items[0].client_msg_id, 'first-id')
+})
+
+test('the final catch-up page and reconnect appends use numeric contiguous cursors', async (t) => {
+  const { node, cwd, storage, call } = await setup(t)
+  const updates = Array.from({ length: 252 }, (_, i) => [
+    sessionText('user_message_chunk', `input ${i}`), sessionText('agent_message_chunk', `reply ${i}`),
+  ]).flat()
+  const session = await seedSession(storage, cwd, {}, updates)
+  assert.equal((await call('session.items', session)).to_seq, 504)
+  const first = await call('session.items', { ...session, after_seq: 1 })
+  assert.equal(first.to_seq, 501)
+  assert.equal(first.more_after, true)
+  const last = await call('session.items', { ...session, after_seq: first.to_seq })
+  assert.equal(last.to_seq, 504)
+  assert.equal(last.more_after, false)
+  const empty = await call('session.items', { ...session, after_seq: last.to_seq })
+  assert.deepEqual(empty.items, [])
+  assert.equal(empty.to_seq, 504)
+  const old = node.peer
+  old.close()
+  await until('node reconnect', () => node.peer !== old)
+  await call('session.watch', { ...session, since_seq: 1, history: last.history })
+  await call('session.send', { ...session, text: 'after reconnect' })
+  await until('append after catch-up', () => node.all('session.items').some((batch) => batch.to_seq === 506))
+  const batches = node.all('session.items')
+  assert.deepEqual(batches.slice(0, 2).map(({ from_seq, to_seq }) => [from_seq, to_seq]), [[1, 501], [501, 504]])
+  assert.equal(batches[2].from_seq, 504)
+  assert.ok(batches.every(({ to_seq }) => Number.isInteger(to_seq)))
+})
+
 test('permissions and cancellation are isolated to the active session', async (t) => {
   const { node, cwd, call } = await setup(t)
   const start = async () => ({ session_id: (await call('session.start', { cwd })).session.session_id })
@@ -127,7 +214,7 @@ test('permissions and cancellation are isolated to the active session', async (t
 
 test('a crashed worker only ends its own turn and saved sessions can continue', async (t) => {
   const { cwd, call } = await setup(t)
-  const { session } = await call('session.start', { cwd, prompt: 'save first' })
+  const { session } = await call('session.start', { cwd, prompt: 'save first', client_msg_id: 'saved-first' })
   const session_id = session.session_id
   const read = () => call('session.items', { session_id })
   await until('saved reply', async () => (await read()).items.at(-1)?.text === 'echo: save first')
@@ -147,6 +234,9 @@ test('a crashed worker only ends its own turn and saved sessions can continue', 
     ...failed, 'saved disconnect', 'saved before exit', '出错了', 'continue again', 'echo: continue again',
   ])
   assert.equal(restored.items[6].client_msg_id, 'saved-turn')
+  assert.equal(restored.items[0].client_msg_id, 'saved-first')
+  await call('session.send', { session_id, text: 'saved disconnect', client_msg_id: 'saved-turn' })
+  assert.deepEqual((await read()).items, restored.items)
 })
 
 test('missing Hermes executable rejects startup and cleans up without a close event', { timeout: 3_000 }, async (t) => {

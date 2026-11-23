@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { createRuntime, interactionId, light, page, RpcError } from '../../runtime-sdk/index.js'
 import { HermesAcp } from './acp.js'
 import { identities, nativeID, personaID, profileHome } from './identity.js'
-import { addItem, applyUpdate, flush, isUserText, restoreFailures, toolInput, toolName, transcript } from './items.js'
+import { addItem, applyUpdate, flush, isUserText, reconcileReplay, restoreFailures, toolInput, toolName, transcript } from './items.js'
 
 const RUNTIME = 'hermes'
 const LABEL = 'Hermes Agent'
@@ -167,9 +167,7 @@ export function createHermesRuntime({
     if (!s.acp || !s.persisted || s.turn || s.loading || s.idleTimer || stopped) return
     s.idleTimer = setTimeout(() => {
       s.idleTimer = undefined
-      const acp = s.acp
-      s.acp = undefined
-      void acp?.stop().catch(() => log('Could not stop an idle Hermes worker'))
+      if (s.acp) discardWorker(s, s.acp)
     }, idleMs)
     s.idleTimer.unref()
   }
@@ -179,9 +177,15 @@ export function createHermesRuntime({
     s.idleTimer = undefined
   }
 
+  function discardWorker(s, acp) {
+    if (s.acp === acp) s.acp = undefined
+    void acp.stop().catch(() => log('Could not stop a retired Hermes worker'))
+  }
+
   function loaded(s) {
     if (s.loading) return s.loading
-    if (s.acp) return Promise.resolve(s.acp)
+    if (s.acp?.writable) return Promise.resolve(s.acp)
+    if (s.acp) discardWorker(s, s.acp)
     s.loading = (async () => {
       if (stopped) throw new Error('Hermes runtime has stopped')
       if (!s.persisted) await scan()
@@ -197,16 +201,15 @@ export function createHermesRuntime({
         flush(s.replay)
         s.model = result.models?.currentModelId ?? s.model
         const previous = s.content
-        const next = restoreFailures(s.replay, s.failures)
-        const comparable = (list) => list.map(({ id, seq, ts, client_msg_id, ...value }) => value)
-        if (!previous || JSON.stringify(comparable(previous.items)) !== JSON.stringify(comparable(next.items))) {
+        const next = reconcileReplay(previous, restoreFailures(s.replay, s.failures))
+        if (next !== previous) {
           if (previous) s.history = randomUUID()
           s.content = next
           publish(s, 0)
         }
         return acp
       } catch (error) {
-        await acp.stop()
+        discardWorker(s, acp)
         throw error
       } finally {
         s.replay = undefined
@@ -226,7 +229,8 @@ export function createHermesRuntime({
 
   async function items(params) {
     const s = await requireSession(params.session_id)
-    return page(await content(s), params, { history: s.history })
+    const all = await content(s)
+    return page(all, params, { history: s.history, toSeq: all.length })
   }
 
   async function item(params) {
@@ -365,8 +369,12 @@ export function createHermesRuntime({
     await begin(await requireSession(params.session_id), text, params.client_msg_id)
   }
 
+  function seen(s, key) {
+    return key && (s.seen.has(key) || s.content?.items.some((item) => item.client_msg_id === key))
+  }
+
   async function begin(s, text, key) {
-    if (key && s.seen.has(key)) return
+    if (seen(s, key)) return
     if (s.turn) throw new RpcError('Hermes is already processing a message', 'turn_running', { delivered: 'none' })
     keepWorker(s)
     let settle
@@ -375,11 +383,24 @@ export function createHermesRuntime({
     s.turn = turn
     s.turnError = undefined
     rt.sessionsChanged()
+    const signal = turn.abort.signal
+    const notDelivered = () => new RpcError('Hermes did not receive the message', 'not_delivered', { delivered: 'none' })
+    let cancelWait
+    const interrupted = new Promise((_, reject) => {
+      cancelWait = () => reject(notDelivered())
+      signal.addEventListener('abort', cancelWait, { once: true })
+    })
+    const release = () => {
+      s.turn = undefined
+      scheduleIdle(s)
+      rt.sessionsChanged()
+      settle()
+    }
     try {
-      turn.acp = await loaded(s)
-      if (turn.abort.signal.aborted || !turn.acp.writable || stopped) {
-        throw new RpcError('Hermes did not receive the message', 'not_delivered', { delivered: 'none' })
-      }
+      turn.acp = await Promise.race([loaded(s), interrupted])
+      if (signal.aborted || !turn.acp.writable || stopped) throw notDelivered()
+      // Loading may have restored the ID from a previously failed turn.
+      if (seen(s, key)) return release()
       if (key) s.seen.add(key)
       if (s.seen.size > 500) s.seen.delete(s.seen.values().next().value)
       const from = s.content.items.length
@@ -394,11 +415,10 @@ export function createHermesRuntime({
         settle()
       })
     } catch (error) {
-      s.turn = undefined
-      scheduleIdle(s)
-      rt.sessionsChanged()
-      settle()
+      release()
       throw error
+    } finally {
+      signal.removeEventListener('abort', cancelWait)
     }
   }
 
@@ -436,7 +456,11 @@ export function createHermesRuntime({
     const turn = s.turn
     if (!turn) return { settled: true }
     turn.abort.abort()
-    if (turn.dispatched) turn.acp.notify('session/cancel', { sessionId: s.raw })
+    if (!turn.dispatched) {
+      await turn.done
+      return
+    }
+    turn.acp.notify('session/cancel', { sessionId: s.raw })
     const timeout = new AbortController()
     try {
       await Promise.race([

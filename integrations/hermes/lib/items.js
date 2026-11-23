@@ -56,6 +56,22 @@ export function isUserText(item) {
   return item.role === 'user' && item.kind === 'text'
 }
 
+export function reconcileReplay(previous, next) {
+  if (!previous) return next
+  const oldInputs = previous.items.filter(isUserText)
+  const newInputs = next.items.filter(isUserText)
+  // ACP replay does not carry Persona's client IDs. Keep them on the matching
+  // input prefix, without attaching an old ID to a different native turn.
+  for (let i = 0; i < Math.min(oldInputs.length, newInputs.length); i++) {
+    if (oldInputs[i].text !== newInputs[i].text) break
+    if (oldInputs[i].client_msg_id && !newInputs[i].client_msg_id) {
+      newInputs[i].client_msg_id = oldInputs[i].client_msg_id
+    }
+  }
+  const comparable = (list) => list.map(({ id, seq, ts, ...value }) => value)
+  return JSON.stringify(comparable(previous.items)) === JSON.stringify(comparable(next.items)) ? previous : next
+}
+
 function chunk(state, update, role, kind) {
   if (update.content?.type !== 'text' || !update.content.text) return
   const message = update.messageId

@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto'
 import { closeSync } from 'node:fs'
-import { readdir, readFile, writeFile } from 'node:fs/promises'
+import { access, readdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
+import { setTimeout as delay } from 'node:timers/promises'
 
 const root = process.env.HERMES_TEST_STATE
 const write = (message) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n')
@@ -49,6 +50,16 @@ for await (const line of lines) {
     case 'session/load':
       session = JSON.parse(await readFile(join(root, params.sessionId + '.json'), 'utf-8'))
       if (process.cwd() !== session.info.cwd) throw new Error('wrong restored worker directory')
+      if (session.holdLoad) {
+        await writeFile(join(root, 'load-started'), '')
+        while (await access(join(root, 'load-hold')).then(() => true, () => false)) await delay(15)
+      }
+      if (session.failLoad) {
+        delete session.failLoad
+        await writeFile(join(root, params.sessionId + '.json'), JSON.stringify(session))
+        write({ id, error: { code: -32000, message: 'Transient load failure' } })
+        break
+      }
       for (const event of session.updates) update(params.sessionId, event)
       reply(id, {})
       break
